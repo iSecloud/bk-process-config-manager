@@ -8,6 +8,7 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and limitations under the License.
 """
+import datetime
 import base64
 import hashlib
 import itertools
@@ -351,7 +352,7 @@ class BulkGenerateConfigService(MultiJobTaskBaseService):
                                 config_instance["config_template_id"]
                             ].template_name,
                             "file_name": config_instance["name"]
-                            or config_template_id_obj_map[config_instance["config_template_id"]].file_name,
+                                         or config_template_id_obj_map[config_instance["config_template_id"]].file_name,
                         }
                         for config_instance in config_instances
                     ]
@@ -372,16 +373,16 @@ class BulkGenerateConfigComponent(Component):
     bound_service = BulkGenerateConfigService
 
 
-class BulkPushConfigService(MultiJobTaskBaseService):
+class BulkExecuteJobPlatformService(MultiJobTaskBaseService):
     """
-    下发配置
+    批量执行与作业平台相关的动作
+    eg: 文件下发，脚本执行
     """
-
     __need_schedule__ = True
     interval = StaticIntervalGenerator(POLLING_INTERVAL)
 
     def request_single_job_and_create_map(
-        self, job_func, job_id: int, job_task_ids: List, job_params: Dict, pipeline_data
+            self, job_func, job_id: int, job_task_ids: List, job_params: Dict, pipeline_data
     ):
         """请求作业平台并创建与订阅实例的映射"""
         job_params.update(
@@ -448,7 +449,7 @@ class BulkPushConfigService(MultiJobTaskBaseService):
         }
         config_instance_id_content_map = {}
         for config_instance in ConfigInstance.objects.filter(
-            config_template_id__in=all_config_template_ids, bk_process_id__in=bk_process_ids, is_latest=True
+                config_template_id__in=all_config_template_ids, bk_process_id__in=bk_process_ids, is_latest=True
         ):
             inst_job_task = process_inst_map.get(
                 process_inst_map_key_tmpl.format(
@@ -498,7 +499,7 @@ class BulkPushConfigService(MultiJobTaskBaseService):
                     )
                 else:
                     multi_job_params_map[key] = {
-                        "job_func": JobApi.push_config_file,
+                        "job_func": data.get_one_of_inputs("job_func"),
                         "job_id": inst_job_task.job_id,
                         "job_task_ids": [inst_job_task.id],
                         "job_params": {
@@ -509,11 +510,21 @@ class BulkPushConfigService(MultiJobTaskBaseService):
                                     {"bk_cloud_id": host_info["bk_cloud_id"], "ip": host_info["bk_host_innerip"]}
                                 ]
                             },
-                            "file_target_path": file_target_path,
-                            "file_list": [{"file_name": file_name, "content": base64.b64encode(file_content).decode()}],
                         },
                         "pipeline_data": data,
                     }
+                    # 添加额外的job_params字段参数
+                    job_params = data.get_one_of_inputs("job_params")
+                    for job_params_key in job_params:
+                        job_params_field = job_params[job_params_key]
+                        # 这里不能用列表推导式，会造成作用域更改
+                        args = []
+                        for arg in job_params_field["args"]:
+                            args.append(locals().get(arg) or arg)
+                        multi_job_params_map[key]["job_params"].update(
+                            {job_params_key: job_params_field["func"](*args)})
+
+        data.inputs.job_params = ""  # 由于pickle不能序列化lambda，所以需要清空
         if multi_job_params_map:
             request_multi_thread(self.request_single_job_and_create_map, multi_job_params_map.values())
         return self.return_data(result=True)
@@ -623,7 +634,7 @@ class BulkPushConfigService(MultiJobTaskBaseService):
 
         # 判断 JobSubscriptionInstanceMap 中对应的 job_instance_id 都执行完成的，把成功的 subscription_instance_ids 向下传递
         is_finished = not (
-            constants.BkJobStatus.PENDING in all_job_result or constants.BkJobStatus.RUNNING in all_job_result
+                constants.BkJobStatus.PENDING in all_job_result or constants.BkJobStatus.RUNNING in all_job_result
         )
         if polling_time + POLLING_INTERVAL > GlobalSettings.pipeline_polling_timeout():
             # 由于JOB的超时机制可能会失效，因此这里自己需要有超时机制进行兜底
@@ -658,6 +669,29 @@ class BulkPushConfigService(MultiJobTaskBaseService):
         ]
 
 
+class BulkPushConfigService(BulkExecuteJobPlatformService):
+    """
+    下发配置
+    """
+
+    def _execute(self, data, parent_data):
+        job_params = {
+            "file_target_path": {
+                "args": ["file_target_path"],
+                "func": lambda file_target_path: file_target_path
+            },
+            "file_list": {
+                "args": ["file_name", "file_content"],
+                "func": lambda file_name, file_content: [{"file_name": file_name,
+                                                          "content": base64.b64encode(file_content).decode()}]
+            }
+        }
+        data.inputs.job_params = job_params
+        data.inputs.job_func = JobApi.push_config_file
+
+        return super()._execute(data, parent_data)
+
+
 class BulkPushConfigComponent(Component):
     name = "BulkPushConfigComponent"
     code = "bulk_push_config"
@@ -683,3 +717,34 @@ class BulkExecuteJobComponent(Component):
     name = "BulkExecuteJobComponent"
     code = "bulk_execute_job"
     bound_service = BulkExecuteJobService
+
+
+class BulkBackupConfigService(BulkExecuteJobPlatformService):
+    """
+    配置文件备份
+    """
+
+    def _execute(self, data, parent_data):
+        script_content = """#!/bin/bash
+            backup_file="{abs_path}"                                                                                                                                                                                                                                                                                        
+            if [ -f "$backup_file" ]; then
+                cp {abs_path} {abs_path}_{now_time}
+            fi"""
+        job_params = {
+            "script_content": {
+                "args": ["file_target_path", "file_name", script_content],
+                "func": lambda file_target_path, file_name, script_details:
+                script_details.format(abs_path="{}/{}".format(file_target_path, file_name),
+                                      now_time=str(datetime.datetime.now()).replace(" ", "-"))
+            }
+        }
+        data.inputs.job_params = job_params
+        data.inputs.job_func = JobApi.fast_execute_script
+
+        return super()._execute(data, parent_data)
+
+
+class BulkBackupConfigComponent(Component):
+    name = "BulkBackupConfigComponent"
+    code = "bulk_backup_job"
+    bound_service = BulkBackupConfigService
